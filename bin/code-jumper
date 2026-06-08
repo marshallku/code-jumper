@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+#
+# code-jumper — open a file:line:col in the already-running Neovim that owns the
+# matching tmux pane, and focus that pane. Designed to be pointed at by
+# LAUNCH_EDITOR so dev-server inspectors (vite /__open-in-editor, react/vue/svelte
+# inspectors) route clicks here. See docs/04-design.md.
+#
+# Invocation forms tolerated (docs/05-launch-editor-internals.md):
+#   code-jumper <file> <line> <col>   # launch-editor + LAUNCH_EDITOR (primary)
+#   code-jumper <file> <line>         # 2-argv variant
+#   code-jumper +<line> <file>        # vim-style
+#   code-jumper <file>:<line>:<col>   # VS Code-style single token
+#   code-jumper <file>:<line>
+#   code-jumper <file>                # line/col default to 1
+
+set -eu
+
+# ---------------------------------------------------------------------------
+# Registry directory — MUST match lua/code-jumper/init.lua registry_dir().
+# Rule: XDG_RUNTIME_DIR, else TMPDIR, else /tmp. Works on Linux + macOS.
+# ---------------------------------------------------------------------------
+cj_registry_dir() {
+    local base="${XDG_RUNTIME_DIR:-}"
+    [ -n "$base" ] || base="${TMPDIR:-}"
+    [ -n "$base" ] || base="/tmp"
+    # Strip ALL trailing slashes, matching the lua side's gsub("/+$", "").
+    while [ -n "$base" ] && [ "${base%/}" != "$base" ]; do base="${base%/}"; done
+    printf '%s/code-jumper\n' "$base"
+}
+
+# Refuse to trust a registry dir another local user could plant entries in
+# (matters for the shared /tmp fallback): must exist, not be a symlink, be owned
+# by us, and not be group/other-writable.
+cj_dir_is_safe() {
+    local dir="$1"
+    [ -d "$dir" ] || return 1
+    [ ! -L "$dir" ] || return 1
+    [ -O "$dir" ] || return 1 # owned by us
+    local mode
+    mode=$(stat -c %a "$dir" 2>/dev/null || stat -f %Lp "$dir" 2>/dev/null) || return 1
+    [ -n "$mode" ] || return 1
+    if (( (8#$mode & 0022) != 0 )); then return 1; fi # group/other write -> unsafe
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing. Sets globals: CJ_FILE, CJ_LINE, CJ_COL.
+# ---------------------------------------------------------------------------
+cj_is_num() { case "$1" in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac }
+
+# Peel ":<num>" suffixes from the right so colons inside a path are preserved.
+# "a:b:10:20" -> file="a:b" line=10 col=20.
+cj_split_colon() {
+    local arg="$1" line="" col=""
+    local suffix="${arg##*:}"
+    if cj_is_num "$suffix" && [ "$suffix" != "$arg" ]; then
+        local head="${arg%:*}"
+        local suffix2="${head##*:}"
+        if cj_is_num "$suffix2" && [ "$suffix2" != "$head" ]; then
+            # file:line:col
+            CJ_FILE="${head%:*}"; CJ_LINE="$suffix2"; CJ_COL="$suffix"
+        else
+            # file:line
+            CJ_FILE="$head"; CJ_LINE="$suffix"
+        fi
+    else
+        CJ_FILE="$arg"
+    fi
+}
+
+cj_parse_args() {
+    CJ_FILE=""; CJ_LINE=1; CJ_COL=1
+
+    if [ "$#" -ge 2 ] && [ "${1#+}" != "$1" ]; then
+        # +<line> <file>  (vim-style)
+        local l="${1#+}"
+        cj_is_num "$l" && CJ_LINE="$l"
+        CJ_FILE="$2"
+    elif [ "$#" -ge 3 ]; then
+        CJ_FILE="$1"
+        cj_is_num "$2" && CJ_LINE="$2"
+        cj_is_num "$3" && CJ_COL="$3"
+    elif [ "$#" -ge 2 ]; then
+        CJ_FILE="$1"
+        cj_is_num "$2" && CJ_LINE="$2"
+    elif [ "$#" -ge 1 ]; then
+        cj_split_colon "$1"
+    fi
+
+    cj_is_num "$CJ_LINE" || CJ_LINE=1
+    cj_is_num "$CJ_COL" || CJ_COL=1
+}
+
+# ---------------------------------------------------------------------------
+# Path handling.
+# ---------------------------------------------------------------------------
+cj_abspath() {
+    # Target file always exists (it's source), so plain realpath works on GNU+BSD.
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$1" 2>/dev/null && return 0
+    fi
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *) printf '%s/%s\n' "$(pwd)" "$1" ;;
+    esac
+}
+
+# True if $1 (a registry cwd) contains $2 (an abs file path), on a path boundary.
+cj_cwd_contains() {
+    local cwd="$1" file="$2"
+    [ "$file" = "$cwd" ] && return 0
+    case "$file" in
+        "${cwd%/}/"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Registry selection. Echoes "socket<TAB>pane<TAB>tmux_socket" of the best match,
+# or nothing. Best = longest live-socket cwd containing the file; on 0 cwd match,
+# the most-recently-registered live entry.
+# ---------------------------------------------------------------------------
+cj_select() {
+    local file="$1" dir="$2"
+    local best_sock="" best_pane="" best_tmux="" best_len=-1
+    local newest_sock="" newest_pane="" newest_tmux="" newest_mtime=-1
+
+    local f sock cwd pane tmux mtime
+    for f in "$dir"/pane-*.tsv; do
+        [ -e "$f" ] || continue
+        IFS=$'\t' read -r sock cwd pane tmux <"$f" || continue
+        [ -n "$sock" ] || continue
+        cj_sock_alive "$sock" || continue # skip dead/stale sockets
+
+        mtime=$(cj_mtime "$f")
+        if [ "$mtime" -gt "$newest_mtime" ]; then
+            newest_mtime="$mtime"
+            newest_sock="$sock"; newest_pane="$pane"; newest_tmux="$tmux"
+        fi
+
+        if cj_cwd_contains "$cwd" "$file"; then
+            local len=${#cwd}
+            if [ "$len" -gt "$best_len" ]; then
+                best_len="$len"
+                best_sock="$sock"; best_pane="$pane"; best_tmux="$tmux"
+            fi
+        fi
+    done
+
+    if [ -n "$best_sock" ]; then
+        printf '%s\t%s\t%s\n' "$best_sock" "$best_pane" "$best_tmux"
+    elif [ -n "$newest_sock" ]; then
+        printf '%s\t%s\t%s\n' "$newest_sock" "$newest_pane" "$newest_tmux"
+    fi
+    return 0 # never fail: an empty result is valid (cj_main handles it under set -e)
+}
+
+cj_mtime() {
+    # GNU stat then BSD stat.
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
+}
+
+# True if an nvim RPC server is actually listening on $1. A bare `[ -S ]` only
+# proves a socket *node* exists — a crashed nvim leaves a stale socket behind —
+# so we cheap-gate on the node then probe with a real connection. Overridable in
+# unit tests (which use non-listening fixture sockets).
+cj_sock_alive() {
+    [ -S "$1" ] || return 1
+    nvim --server "$1" --remote-expr '1' >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Open + focus.
+# ---------------------------------------------------------------------------
+cj_open() {
+    local sock="$1" file="$2" line="$3" col="$4"
+    # --remote passes the filename as an argv (space/special-char safe) and the
+    # RPC returns only after the server has opened it, so the subsequent cursor
+    # call lands on the loaded buffer. <C-\><C-N> first leaves insert/terminal mode.
+    nvim --server "$sock" --remote "$file"
+    nvim --server "$sock" --remote-send "<C-\\><C-N>:call cursor(${line},${col})<CR>"
+}
+
+cj_focus() {
+    local pane="$1" tmux_sock="$2"
+    [ -n "$pane" ] || return 0
+    local tmux=(tmux)
+    [ -n "$tmux_sock" ] && tmux=(tmux -S "$tmux_sock")
+
+    local tgt
+    tgt=$("${tmux[@]}" display -p -t "$pane" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null) || return 0
+    [ -n "$tgt" ] || return 0
+    local sess="${tgt%%:*}"
+
+    "${tmux[@]}" select-window -t "$tgt" 2>/dev/null || true
+    "${tmux[@]}" select-pane -t "$pane" 2>/dev/null || true
+
+    # Only switch the attached client if it's on a different session.
+    local cur
+    cur=$("${tmux[@]}" display -p '#{session_name}' 2>/dev/null) || cur=""
+    if [ -n "$cur" ] && [ "$cur" != "$sess" ]; then
+        "${tmux[@]}" switch-client -t "$sess" 2>/dev/null || true
+    fi
+}
+
+# Optional best-effort OS-window raise (isolated, never fatal).
+cj_raise_os_window() {
+    case "$(uname)" in
+        Darwin)
+            [ -n "${TERM_PROGRAM:-}" ] && osascript -e 'tell application "'"$TERM_PROGRAM"'" to activate' 2>/dev/null || true
+            ;;
+        Linux)
+            if command -v hyprctl >/dev/null 2>&1; then
+                hyprctl dispatch focuswindow "class:(.*[Tt]erm.*)" >/dev/null 2>&1 || true
+            elif command -v wmctrl >/dev/null 2>&1; then
+                wmctrl -a "term" >/dev/null 2>&1 || true
+            fi
+            ;;
+    esac
+}
+
+cj_main() {
+    cj_parse_args "$@"
+    if [ -z "$CJ_FILE" ]; then
+        echo "code-jumper: no file given" >&2
+        return 2
+    fi
+
+    local dir
+    dir="$(cj_registry_dir)"
+    if ! cj_dir_is_safe "$dir"; then
+        echo "code-jumper: registry dir missing or untrusted: $dir" >&2
+        return 1
+    fi
+
+    local file
+    file="$(cj_abspath "$CJ_FILE")"
+
+    local sel sock pane tmux
+    sel="$(cj_select "$file" "$dir")"
+    if [ -z "$sel" ]; then
+        echo "code-jumper: no live nvim found for $file" >&2
+        return 1
+    fi
+    IFS=$'\t' read -r sock pane tmux <<<"$sel"
+
+    cj_open "$sock" "$file" "$CJ_LINE" "$CJ_COL"
+    cj_focus "$pane" "$tmux"
+    cj_raise_os_window
+}
+
+# Run main only when executed, not when sourced (for unit tests).
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    cj_main "$@"
+fi
