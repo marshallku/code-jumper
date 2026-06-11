@@ -62,12 +62,26 @@ SOCK_OUTER="$REG/nvim-1.sock"; mksock "$SOCK_OUTER"
 SOCK_INNER="$REG/nvim-2.sock"; mksock "$SOCK_INNER"
 printf '%s\t%s\t%s\t%s\n' "$SOCK_OUTER" "/home/u/proj"        "%1" "/tmp/tmux-1/default" >"$REG/pane-1.tsv"
 printf '%s\t%s\t%s\t%s\n' "$SOCK_INNER" "/home/u/proj/packages/app" "%2" "/tmp/tmux-1/default" >"$REG/pane-2.tsv"
+# Deterministic mtimes (pane-2 newest) so the most-recent-fallback test isn't a
+# coarse-second tie. -t format is portable across GNU and BSD touch.
+touch -t 202001010000 "$REG/pane-1.tsv"
+touch -t 202001010001 "$REG/pane-2.tsv"
 
 sel="$(cj_select /home/u/proj/packages/app/src/x.ts "$REG")"
 check "longest cwd wins" "$SOCK_INNER	%2	/tmp/tmux-1/default" "$sel"
 
 sel2="$(cj_select /home/u/proj/lib/y.ts "$REG")"
 check "shallower file -> outer" "$SOCK_OUTER	%1	/tmp/tmux-1/default" "$sel2"
+
+# A file under NO registered cwd: non-strict falls back to most-recent live...
+sel_fb="$(cj_select /elsewhere/z.ts "$REG")"
+check "non-match -> most-recent fallback" "$SOCK_INNER	%2	/tmp/tmux-1/default" "$sel_fb"
+# ...but strict mode (daemon security boundary) returns nothing.
+sel_strict="$(CJ_STRICT=1 cj_select /elsewhere/z.ts "$REG")"
+check "non-match + strict -> empty" "" "$sel_strict"
+# strict still opens a legitimately-matched file.
+sel_strict_ok="$(CJ_STRICT=1 cj_select /home/u/proj/packages/app/src/x.ts "$REG")"
+check "match + strict -> still selects" "$SOCK_INNER	%2	/tmp/tmux-1/default" "$sel_strict_ok"
 
 # Dead socket (file present in tsv but socket removed) is skipped.
 rm -f "$SOCK_INNER"
@@ -78,6 +92,18 @@ check "dead inner socket falls back to outer" "$SOCK_OUTER	%1	/tmp/tmux-1/defaul
 rm -f "$SOCK_OUTER"
 sel4="$(cj_select /home/u/proj/src/x.ts "$REG")"
 check "no live socket -> empty" "" "$sel4"
+
+# --- cj_registry_dir resolution order ------------------------------------
+RDT="$(mktemp -d)"
+mkdir -p "$RDT/code-jumper"
+printf 'port=1\ntoken=x\nregistry_dir=/pinned/dir\n' >"$RDT/code-jumper/config"
+check "env override wins (slash stripped)" "/env/dir" \
+    "$(CODE_JUMPER_REGISTRY_DIR=/env/dir/ XDG_CONFIG_HOME="$RDT" cj_registry_dir)"
+check "config pin used when env unset" "/pinned/dir" \
+    "$(CODE_JUMPER_REGISTRY_DIR= XDG_CONFIG_HOME="$RDT" cj_registry_dir)"
+check "default rule when no env/config" "/run/x/code-jumper" \
+    "$(CODE_JUMPER_REGISTRY_DIR= XDG_CONFIG_HOME="$RDT/none" XDG_RUNTIME_DIR=/run/x cj_registry_dir)"
+rm -rf "$RDT"
 
 # --- summary -------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

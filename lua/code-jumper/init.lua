@@ -11,10 +11,42 @@ local M = {}
 
 local SEP = "\t"
 
---- Resolve the registry directory. MUST stay byte-for-byte in sync with the
---- launcher's `cj_registry_dir`. Rule: XDG_RUNTIME_DIR, else TMPDIR, else /tmp.
---- Works on Linux (XDG set) and macOS (TMPDIR set).
+--- Read `registry_dir` pinned in the daemon config, if present. This is the
+--- shared source of truth that keeps the plugin and a service-managed daemon on
+--- the same dir even when their envs differ (notably macOS TMPDIR).
+local function config_registry_dir()
+    local base = vim.env.XDG_CONFIG_HOME
+    if not base or base == "" then
+        base = (vim.env.HOME or "") .. "/.config"
+    end
+    local fd = io.open(base .. "/code-jumper/config", "r")
+    if not fd then
+        return nil
+    end
+    local result
+    for line in fd:lines() do
+        local v = line:match("^registry_dir=(.*)$")
+        if v and v ~= "" then
+            result = v:gsub("/+$", "")
+            break
+        end
+    end
+    fd:close()
+    return result
+end
+
+--- Resolve the registry directory. MUST stay in sync with the launcher's
+--- `cj_registry_dir`. Order: CODE_JUMPER_REGISTRY_DIR override, else the
+--- daemon-config pin, else XDG_RUNTIME_DIR, else TMPDIR, else /tmp.
 local function registry_dir()
+    local override = vim.env.CODE_JUMPER_REGISTRY_DIR
+    if override and override ~= "" then
+        return (override:gsub("/+$", ""))
+    end
+    local pinned = config_registry_dir()
+    if pinned then
+        return pinned
+    end
     local base = vim.env.XDG_RUNTIME_DIR
     if not base or base == "" then
         base = vim.env.TMPDIR

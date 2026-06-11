@@ -17,14 +17,40 @@ set -eu
 
 # ---------------------------------------------------------------------------
 # Registry directory — MUST match lua/code-jumper/init.lua registry_dir().
-# Rule: XDG_RUNTIME_DIR, else TMPDIR, else /tmp. Works on Linux + macOS.
+# Resolution order (single source of truth across daemon, plugin, launcher):
+#   1. CODE_JUMPER_REGISTRY_DIR env override
+#   2. `registry_dir` pinned in the daemon config (so the plugin and a
+#      service-managed daemon agree even when the service env differs from the
+#      tmux/shell that started nvim — notably macOS TMPDIR)
+#   3. XDG_RUNTIME_DIR, else TMPDIR, else /tmp  (+ /code-jumper)
 # ---------------------------------------------------------------------------
+cj_strip_slashes() { local s="$1"; while [ -n "$s" ] && [ "${s%/}" != "$s" ]; do s="${s%/}"; done; printf '%s' "$s"; }
+
+cj_config_registry_dir() {
+    local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/code-jumper/config"
+    [ -f "$cfg" ] || return 1
+    local line rd=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in registry_dir=*) rd="${line#registry_dir=}"; break ;; esac
+    done <"$cfg"
+    [ -n "$rd" ] || return 1
+    cj_strip_slashes "$rd"
+}
+
 cj_registry_dir() {
+    if [ -n "${CODE_JUMPER_REGISTRY_DIR:-}" ]; then
+        cj_strip_slashes "$CODE_JUMPER_REGISTRY_DIR"; printf '\n'
+        return 0
+    fi
+    local rd
+    if rd="$(cj_config_registry_dir)" && [ -n "$rd" ]; then
+        printf '%s\n' "$rd"
+        return 0
+    fi
     local base="${XDG_RUNTIME_DIR:-}"
     [ -n "$base" ] || base="${TMPDIR:-}"
     [ -n "$base" ] || base="/tmp"
-    # Strip ALL trailing slashes, matching the lua side's gsub("/+$", "").
-    while [ -n "$base" ] && [ "${base%/}" != "$base" ]; do base="${base%/}"; done
+    base="$(cj_strip_slashes "$base")"
     printf '%s/code-jumper\n' "$base"
 }
 
@@ -118,7 +144,9 @@ cj_cwd_contains() {
 # ---------------------------------------------------------------------------
 # Registry selection. Echoes "socket<TAB>pane<TAB>tmux_socket" of the best match,
 # or nothing. Best = longest live-socket cwd containing the file; on 0 cwd match,
-# the most-recently-registered live entry.
+# the most-recently-registered live entry — UNLESS strict mode (CJ_STRICT=1), in
+# which case a non-match returns nothing. Strict is the security boundary for the
+# daemon: a request for /etc/passwd must NOT open in some unrelated nvim.
 # ---------------------------------------------------------------------------
 cj_select() {
     local file="$1" dir="$2"
@@ -149,7 +177,7 @@ cj_select() {
 
     if [ -n "$best_sock" ]; then
         printf '%s\t%s\t%s\n' "$best_sock" "$best_pane" "$best_tmux"
-    elif [ -n "$newest_sock" ]; then
+    elif [ -n "$newest_sock" ] && [ "${CJ_STRICT:-0}" != "1" ]; then
         printf '%s\t%s\t%s\n' "$newest_sock" "$newest_pane" "$newest_tmux"
     fi
     return 0 # never fail: an empty result is valid (cj_main handles it under set -e)
@@ -220,6 +248,13 @@ cj_raise_os_window() {
 }
 
 cj_main() {
+    # --strict disables the most-recent-nvim fallback (security boundary for the
+    # daemon). May also be set via CJ_STRICT=1 in the environment.
+    if [ "${1:-}" = "--strict" ]; then
+        CJ_STRICT=1
+        shift
+    fi
+
     cj_parse_args "$@"
     if [ -z "$CJ_FILE" ]; then
         echo "code-jumper: no file given" >&2

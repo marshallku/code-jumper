@@ -22,6 +22,10 @@ SESS="cjtest"
 # Isolate the registry dir so we don't read the user's real nvims.
 export XDG_RUNTIME_DIR="$WORK/xdg"
 mkdir -p "$XDG_RUNTIME_DIR"
+# Isolate XDG_CONFIG_HOME (empty) so the registry resolution can't pick up a real
+# ~/.config/code-jumper/config pin and diverge from this test's XDG_RUNTIME_DIR.
+export XDG_CONFIG_HOME="$WORK/cfg"
+mkdir -p "$XDG_CONFIG_HOME"
 REG="$XDG_RUNTIME_DIR/code-jumper"
 
 TM=(tmux -S "$TMUX_SOCK")

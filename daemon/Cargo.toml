@@ -1,0 +1,17 @@
+[package]
+name = "code-jumper-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "Local HTTP daemon that routes browser jump-to-source requests into code-jumper's bash launcher (nvim-in-tmux)."
+license = "MIT"
+
+[[bin]]
+name = "code-jumper-daemon"
+path = "src/main.rs"
+
+[dependencies]
+tiny_http = "0.12"
+
+[profile.release]
+strip = true
+lto = true

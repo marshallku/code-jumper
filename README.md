@@ -76,17 +76,54 @@ code-jumper /path/app.tsx           # bare (line/col → 1)
 
 Everything works when the terminal is already the focused OS window (the normal alt-tab case). When it isn't, the launcher makes a best-effort raise via `osascript` (macOS) or `hyprctl`/`wmctrl` (Linux). This is the only OS-divergent code and is never fatal.
 
+## Browser integration without per-project config — the daemon
+
+The `LAUNCH_EDITOR` route above needs each dev server to expose an open-in-editor endpoint (e.g. a Vite middleware), i.e. per-project wiring. To avoid that entirely, `daemon/` is a small static Rust binary (`code-jumper-daemon`) that runs as a **per-user login service** and exposes one fixed local address. A browser inspector (e.g. [LocatorJS](https://www.locatorjs.com/)) points at that address for *every* project — no dev-server changes anywhere.
+
+```
+LocatorJS (window.open / fetch) → http://127.0.0.1:<port>/open?token=…&file=…:line:col
+                                     │  code-jumper-daemon (127.0.0.1 only, token-gated)
+                                     └─ spawns  bin/code-jumper --strict <file>  → nvim + tmux
+```
+
+It reuses the bash launcher as the engine — one engine, two front-ends (`LAUNCH_EDITOR` argv and HTTP).
+
+### Build & install
+
+```bash
+cargo build --release --manifest-path daemon/Cargo.toml
+./daemon/target/release/code-jumper-daemon install   # writes config + login service, prints wiring
+```
+
+`install` branches on the OS (`systemd --user` on Linux, a `launchd` LaunchAgent on macOS), generates a random token + port, and prints (1) the LocatorJS custom-template string and (2) an optional userscript. Re-print anytime with `code-jumper-daemon userscript`; check it with `code-jumper-daemon status`; remove with `uninstall`.
+
+### Security model
+
+A daemon that opens local files from HTTP is a new attack surface, so:
+
+- **127.0.0.1 bind only** — never reachable off-host.
+- **Random token** on `/open`, constant-time compared — blocks drive-by/CSRF from random sites (they can fire no-cors requests but don't know the token).
+- **`--strict` launcher mode** — the daemon never uses the most-recent-nvim fallback, so a request for a file under *no* registered nvim cwd (e.g. `/etc/passwd`) opens nothing. The registry is the allowlist.
+
+### Registry-dir agreement
+
+A service's environment can differ from the tmux/shell that started nvim (notably macOS `TMPDIR`), which would make the daemon and the nvim plugin disagree on the registry path. To keep them on one path, all three components (daemon, launcher, plugin) resolve the registry dir in the same order: `CODE_JUMPER_REGISTRY_DIR` env override → the `registry_dir` value pinned in the daemon config (the single source of truth `install` writes) → `XDG_RUNTIME_DIR`/`TMPDIR`/`/tmp`. So once installed, the plugin reads the same pinned dir the daemon uses, regardless of env drift; without the daemon, the plugin still works via the default rule.
+
 ## Tests
 
 ```bash
-bash tests/unit.sh   # arg parsing + registry selection (no tmux/nvim needed)
-bash tests/e2e.sh    # real tmux pane + real nvim: register → open → focus → cleanup
+bash tests/unit.sh                       # bash: arg parsing + registry selection + strict mode
+bash tests/e2e.sh                        # bash: real tmux + nvim, register → open → focus → cleanup
+cargo test --manifest-path daemon/Cargo.toml   # rust: util units + HTTP/auth integration (fake launcher)
+bash tests/e2e-daemon.sh                 # full chain: HTTP → launcher → nvim, incl. strict + bad-token
 ```
 
-`tests/unit.sh` needs `python3` (to mint throwaway unix sockets). `tests/e2e.sh` needs `tmux` + `nvim` and skips cleanly if either is missing.
+`tests/unit.sh` needs `python3` (to mint throwaway unix sockets). The e2e scripts need `tmux` + `nvim` (and `e2e-daemon.sh` also `curl` + `python3`) and skip cleanly if a dependency is missing.
 
 ## Limitations / notes
 
 - One nvim per tmux pane (per-pane socket). Multiple nvims matching the same cwd → the launcher picks the most-recently-registered live one. A `tmux display-menu` chooser is a possible follow-up.
 - Registry lines are tab-separated; a project path containing a literal tab or newline is unsupported (pathological).
 - Zero-config `lsof` socket discovery (for nvims started without the plugin) is intentionally **not** shipped — the plugin's registry is the only discovery path.
+- The LocatorJS custom template substitutes the file path into a query string without URL-encoding it (LocatorJS limitation), so a source path containing `&`, `#`, or a space would be truncated/misparsed before the daemon sees it. The daemon percent-decodes whatever it receives, so a client that *does* encode the path works; raw bare paths with those characters do not. Such paths are rare in practice.
+- The macOS `launchd` install path is implemented but untested on this Linux dev box; the `systemd --user` path is the one covered by `tests/e2e-daemon.sh`.
