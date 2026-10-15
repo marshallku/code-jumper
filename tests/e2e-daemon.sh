@@ -20,7 +20,9 @@ if [ ! -x "$DAEMON" ]; then
     ( cd "$REPO/daemon" && cargo build ) >/dev/null 2>&1 || { echo "SKIP: cargo build failed"; exit 0; }
 fi
 
-WORK="$(mktemp -d)"
+# Physical path: macOS $TMPDIR lives under the /var -> /private/var symlink,
+# while nvim and realpath report the resolved form.
+WORK="$(cd "$(mktemp -d)" && pwd -P)"
 TMUX_SOCK="$WORK/tmux.sock"
 SESS="cjd"
 export XDG_RUNTIME_DIR="$WORK/xdg"

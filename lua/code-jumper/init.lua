@@ -1,8 +1,10 @@
 --- code-jumper — nvim side.
 ---
 --- Registers this Neovim instance so the `code-jumper` launcher can find it and
---- focus its tmux pane. Active only inside tmux. Writes one registry file per
---- pane containing a single tab-separated line: `socket<TAB>cwd<TAB>pane<TAB>tmux_socket`.
+--- focus its pane. Active only inside tmux or comux. Writes one registry file per
+--- pane containing a single tab-separated line:
+--- `socket<TAB>cwd<TAB>pane<TAB>mux_socket<TAB>mux` where `mux` is `tmux` or
+--- `comux`, and `pane` is the tmux pane id or the comux `$COPAD_MUX_PANE` token.
 ---
 --- See docs/04-design.md for the contract; the launcher (bin/code-jumper) must
 --- resolve the registry directory with the same rule used here.
@@ -85,6 +87,34 @@ local function tmux_server_id()
     return (pid or ""):gsub("[^%w]", "")
 end
 
+--- Which multiplexer owns this nvim's pane, or nil outside both. tmux wins when
+--- both are present so existing tmux setups keep their behavior.
+local function detect_mux()
+    local tmux_pane = vim.env.TMUX_PANE
+    if vim.env.TMUX and vim.env.TMUX ~= "" and tmux_pane and tmux_pane ~= "" then
+        local server = tmux_server_id()
+        return {
+            kind = "tmux",
+            pane = tmux_pane,
+            socket = tmux_socket(),
+            -- Pane ids (`%1`) are only unique per server: key on <server-pid>-<pane>
+            key = (server ~= "" and (server .. "-") or "") .. sanitize(tmux_pane),
+        }
+    end
+
+    local token = vim.env.COPAD_MUX_PANE
+    if vim.env.COPAD_MUX and vim.env.COPAD_MUX ~= "" and token and token ~= "" then
+        return {
+            kind = "comux",
+            pane = token,
+            socket = vim.env.COPAD_MUX_SOCK or "",
+            -- Tokens are unique across the whole comux server
+            key = "comux-" .. sanitize(token),
+        }
+    end
+    return nil
+end
+
 local function ensure_dir(dir)
     -- 0700 so the /tmp fallback can't be read/spoofed by other local users.
     vim.fn.mkdir(dir, "p", "0700")
@@ -113,7 +143,7 @@ end
 local state = {
     socket = nil,
     file = nil,
-    pane = nil,
+    mux = nil,
 }
 
 local function start_server(sock)
@@ -135,8 +165,9 @@ local function write_registry()
     local line = table.concat({
         state.socket,
         vim.fn.getcwd(),
-        state.pane,
-        tmux_socket(),
+        state.mux.pane,
+        state.mux.socket,
+        state.mux.kind,
     }, SEP) .. "\n"
     local fd = io.open(state.file, "w")
     if not fd then
@@ -158,8 +189,8 @@ end
 
 --- Register this instance: start the server and write the registry file.
 local function register()
-    local pane = vim.env.TMUX_PANE
-    if not pane or pane == "" then
+    local mux = detect_mux()
+    if not mux then
         return
     end
     local dir = registry_dir()
@@ -170,12 +201,9 @@ local function register()
         return
     end
 
-    -- Key on <server-pid>-<pane> so two tmux servers can't collide on `%1`.
-    local server = tmux_server_id()
-    local key = (server ~= "" and (server .. "-") or "") .. sanitize(pane)
-    state.pane = pane
-    state.socket = dir .. "/nvim-" .. key .. ".sock"
-    state.file = dir .. "/pane-" .. key .. ".tsv"
+    state.mux = mux
+    state.socket = dir .. "/nvim-" .. mux.key .. ".sock"
+    state.file = dir .. "/pane-" .. mux.key .. ".tsv"
 
     if not start_server(state.socket) then
         state.socket = nil
@@ -188,8 +216,8 @@ end
 function M.setup(opts)
     M.opts = opts or {}
 
-    -- Only meaningful inside tmux.
-    if not vim.env.TMUX or vim.env.TMUX == "" then
+    -- Only meaningful inside a multiplexer that can focus our pane.
+    if not detect_mux() then
         return
     end
 
@@ -223,6 +251,7 @@ M._registry_dir = registry_dir
 M._sanitize = sanitize
 M._tmux_socket = tmux_socket
 M._tmux_server_id = tmux_server_id
+M._detect_mux = detect_mux
 M._dir_is_safe = dir_is_safe
 
 return M

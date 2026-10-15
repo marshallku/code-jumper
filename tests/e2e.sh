@@ -16,7 +16,9 @@ LAUNCHER="$REPO/bin/code-jumper"
 command -v tmux >/dev/null || { echo "SKIP: tmux not installed"; exit 0; }
 command -v nvim >/dev/null || { echo "SKIP: nvim not installed"; exit 0; }
 
-WORK="$(mktemp -d)"
+# Physical path: macOS $TMPDIR lives under the /var -> /private/var symlink,
+# while nvim and realpath report the resolved form.
+WORK="$(cd "$(mktemp -d)" && pwd -P)"
 TMUX_SOCK="$WORK/tmux.sock"
 SESS="cjtest"
 # Isolate the registry dir so we don't read the user's real nvims.
@@ -67,8 +69,9 @@ done
 [ -n "$TSV" ] || { bad "nvim never wrote a registry file"; echo "1 failures"; exit 1; }
 ok "registry file written: $(basename "$TSV")"
 
-IFS=$'\t' read -r SOCK CWD PANE TMUXS <"$TSV"
+IFS=$'\t' read -r SOCK CWD PANE TMUXS MUX <"$TSV"
 [ -S "$SOCK" ] && ok "live socket present" || bad "socket not a live socket: $SOCK"
+[ "$MUX" = "tmux" ] && ok "mux recorded = tmux" || bad "mux mismatch: $MUX"
 [ "$CWD" = "$PROJ" ] && ok "cwd recorded = project" || bad "cwd mismatch: $CWD != $PROJ"
 
 # Helper to query the running nvim.

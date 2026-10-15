@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # code-jumper — open a file:line:col in the already-running Neovim that owns the
-# matching tmux pane, and focus that pane. Designed to be pointed at by
+# matching tmux or comux pane, and focus that pane. Designed to be pointed at by
 # LAUNCH_EDITOR so dev-server inspectors (vite /__open-in-editor, react/vue/svelte
 # inspectors) route clicks here. See docs/04-design.md.
 #
@@ -142,43 +142,55 @@ cj_cwd_contains() {
 }
 
 # ---------------------------------------------------------------------------
-# Registry selection. Echoes "socket<TAB>pane<TAB>tmux_socket" of the best match,
+# Registry selection. Echoes "socket<TAB>pane<TAB>mux_socket<TAB>mux" of the best
+# match (mux is "tmux" or "comux"; 4-field lines from older plugins mean tmux),
 # or nothing. Best = longest live-socket cwd containing the file; on 0 cwd match,
 # the most-recently-registered live entry — UNLESS strict mode (CJ_STRICT=1), in
 # which case a non-match returns nothing. Strict is the security boundary for the
 # daemon: a request for /etc/passwd must NOT open in some unrelated nvim.
 # ---------------------------------------------------------------------------
+# Read one tab-separated line from stdin into the named vars. Tab is an IFS
+# whitespace char, so a plain `read` merges consecutive tabs and shifts fields
+# left when one is empty (e.g. a comux entry with no socket); mapping tabs to the
+# non-whitespace US (0x1f) keeps empty fields in place.
+cj_read_tsv() {
+    local line
+    IFS= read -r line || [ -n "$line" ] || return 1
+    IFS=$'\x1f' read -r "$@" <<<"${line//$'\t'/$'\x1f'}"
+}
+
 cj_select() {
     local file="$1" dir="$2"
-    local best_sock="" best_pane="" best_tmux="" best_len=-1
-    local newest_sock="" newest_pane="" newest_tmux="" newest_mtime=-1
+    local best="" best_len=-1
+    local newest="" newest_mtime=-1
 
-    local f sock cwd pane tmux mtime
+    local f sock cwd pane mux_sock mux mtime entry
     for f in "$dir"/pane-*.tsv; do
         [ -e "$f" ] || continue
-        IFS=$'\t' read -r sock cwd pane tmux <"$f" || continue
+        cj_read_tsv sock cwd pane mux_sock mux <"$f" || continue
         [ -n "$sock" ] || continue
         cj_sock_alive "$sock" || continue # skip dead/stale sockets
+        entry="$(printf '%s\t%s\t%s\t%s' "$sock" "$pane" "$mux_sock" "${mux:-tmux}")"
 
         mtime=$(cj_mtime "$f")
         if [ "$mtime" -gt "$newest_mtime" ]; then
             newest_mtime="$mtime"
-            newest_sock="$sock"; newest_pane="$pane"; newest_tmux="$tmux"
+            newest="$entry"
         fi
 
         if cj_cwd_contains "$cwd" "$file"; then
             local len=${#cwd}
             if [ "$len" -gt "$best_len" ]; then
                 best_len="$len"
-                best_sock="$sock"; best_pane="$pane"; best_tmux="$tmux"
+                best="$entry"
             fi
         fi
     done
 
-    if [ -n "$best_sock" ]; then
-        printf '%s\t%s\t%s\n' "$best_sock" "$best_pane" "$best_tmux"
-    elif [ -n "$newest_sock" ] && [ "${CJ_STRICT:-0}" != "1" ]; then
-        printf '%s\t%s\t%s\n' "$newest_sock" "$newest_pane" "$newest_tmux"
+    if [ -n "$best" ]; then
+        printf '%s\n' "$best"
+    elif [ -n "$newest" ] && [ "${CJ_STRICT:-0}" != "1" ]; then
+        printf '%s\n' "$newest"
     fi
     return 0 # never fail: an empty result is valid (cj_main handles it under set -e)
 }
@@ -210,8 +222,29 @@ cj_open() {
 }
 
 cj_focus() {
-    local pane="$1" tmux_sock="$2"
+    local pane="$1" mux_sock="$2" mux="$3"
     [ -n "$pane" ] || return 0
+    case "$mux" in
+        comux) cj_focus_comux "$pane" "$mux_sock" ;;
+        *) cj_focus_tmux "$pane" "$mux_sock" ;;
+    esac
+}
+
+# comux addresses a pane anywhere in the mux by its $COPAD_MUX_PANE token; `jump`
+# switches session/tab/pane in one step. COPAD_MUX_SOCK pins the server the nvim
+# registered with (the daemon runs outside comux and has no env of its own).
+cj_focus_comux() {
+    local token="$1" mux_sock="$2"
+    command -v comux >/dev/null 2>&1 || return 0
+    if [ -n "$mux_sock" ]; then
+        COPAD_MUX_SOCK="$mux_sock" comux jump "$token" >/dev/null 2>&1 || true
+    else
+        comux jump "$token" >/dev/null 2>&1 || true
+    fi
+}
+
+cj_focus_tmux() {
+    local pane="$1" tmux_sock="$2"
     local tmux=(tmux)
     [ -n "$tmux_sock" ] && tmux=(tmux -S "$tmux_sock")
 
@@ -271,16 +304,16 @@ cj_main() {
     local file
     file="$(cj_abspath "$CJ_FILE")"
 
-    local sel sock pane tmux
+    local sel sock pane mux_sock mux
     sel="$(cj_select "$file" "$dir")"
     if [ -z "$sel" ]; then
         echo "code-jumper: no live nvim found for $file" >&2
         return 1
     fi
-    IFS=$'\t' read -r sock pane tmux <<<"$sel"
+    cj_read_tsv sock pane mux_sock mux <<<"$sel"
 
     cj_open "$sock" "$file" "$CJ_LINE" "$CJ_COL"
-    cj_focus "$pane" "$tmux"
+    cj_focus "$pane" "$mux_sock" "$mux"
     cj_raise_os_window
 }
 

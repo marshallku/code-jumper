@@ -1,6 +1,6 @@
 # code-jumper
 
-Click an element in the browser → jump to its source in **Neovim running inside tmux**, on both **macOS and Linux**.
+Click an element in the browser → jump to its source in **Neovim running inside tmux or [comux](https://github.com/marshallku/copad)**, on both **macOS and Linux**.
 
 A replacement for the "click-to-source" experience of [LocatorJS](https://www.locatorjs.com/) and friends, but targeting an editor that lives inside a tmux pane instead of a GUI editor the OS can launch via a URL scheme. The full rationale and design live in [`docs/`](./docs); this README is the operational guide.
 
@@ -14,12 +14,13 @@ browser click → dev-server inspector → launch-editor → $LAUNCH_EDITOR (thi
      ├─ nvim --server <sock> --remote <file>   (open, argv-safe)
      ├─ nvim --server <sock> --remote-send '…cursor(line,col)…'
      └─ tmux select-window/select-pane/switch-client   (focus, OS-agnostic)
+        or COPAD_MUX_SOCK=<sock> comux jump <token>      (comux panes)
 ```
 
 Two pieces:
 
-- **`lua/code-jumper`** — a tiny Neovim plugin. Inside tmux, each nvim starts an RPC server on a known socket and writes a registry file recording `{socket, cwd, pane, tmux-socket}`. This is the single source of truth for "which nvim, and where on screen."
-- **`bin/code-jumper`** — a dependency-free bash launcher. Parses the file/line/col, picks the right nvim from the registry (longest matching cwd; skips dead sockets), opens the file, and focuses its tmux pane.
+- **`lua/code-jumper`** — a tiny Neovim plugin. Inside tmux or comux, each nvim starts an RPC server on a known socket and writes a registry file recording `{socket, cwd, pane, mux-socket, mux}` (`pane` is the tmux pane id or the comux `$COPAD_MUX_PANE` token). This is the single source of truth for "which nvim, and where on screen."
+- **`bin/code-jumper`** — a dependency-free bash launcher. Parses the file/line/col, picks the right nvim from the registry (longest matching cwd; skips dead sockets), opens the file, and focuses its tmux or comux pane.
 
 The registry directory is resolved identically on both sides: `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/code-jumper` (Linux uses `XDG_RUNTIME_DIR`, macOS uses `TMPDIR`). It's created `0700` and the launcher refuses to trust it if it isn't owned by you — so the shared-`/tmp` fallback can't be spoofed.
 
@@ -33,7 +34,7 @@ With **lazy.nvim**:
 { "marshallku/code-jumper" }
 ```
 
-Or any plugin manager / a bare `runtimepath` entry. The plugin auto-registers on load; `setup()` is idempotent and a no-op outside tmux, so no configuration is required. Calling `require("code-jumper").setup()` yourself is fine too.
+Or any plugin manager / a bare `runtimepath` entry. The plugin auto-registers on load; `setup()` is idempotent and a no-op outside tmux/comux, so no configuration is required. Calling `require("code-jumper").setup()` yourself is fine too.
 
 > Requires Neovim with built-in `--server`/`--remote`/`--remote-send` (0.x+). `nvr` is **not** needed.
 
@@ -122,7 +123,8 @@ bash tests/e2e-daemon.sh                 # full chain: HTTP → launcher → nvi
 
 ## Limitations / notes
 
-- One nvim per tmux pane (per-pane socket). Multiple nvims matching the same cwd → the launcher picks the most-recently-registered live one. A `tmux display-menu` chooser is a possible follow-up.
+- When both `$TMUX` and `$COPAD_MUX` are set, the nvim registers as a tmux pane. Focusing a comux pane needs `comux` on the launcher's `PATH`.
+- One nvim per tmux/comux pane (per-pane socket). Multiple nvims matching the same cwd → the launcher picks the most-recently-registered live one. A `tmux display-menu` chooser is a possible follow-up.
 - Registry lines are tab-separated; a project path containing a literal tab or newline is unsupported (pathological).
 - Zero-config `lsof` socket discovery (for nvims started without the plugin) is intentionally **not** shipped — the plugin's registry is the only discovery path.
 - The LocatorJS custom template substitutes the file path into a query string without URL-encoding it (LocatorJS limitation), so a source path containing `&`, `#`, or a space would be truncated/misparsed before the daemon sees it. The daemon percent-decodes whatever it receives, so a client that *does* encode the path works; raw bare paths with those characters do not. Such paths are rare in practice.

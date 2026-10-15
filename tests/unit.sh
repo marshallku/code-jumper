@@ -68,30 +68,56 @@ touch -t 202001010000 "$REG/pane-1.tsv"
 touch -t 202001010001 "$REG/pane-2.tsv"
 
 sel="$(cj_select /home/u/proj/packages/app/src/x.ts "$REG")"
-check "longest cwd wins" "$SOCK_INNER	%2	/tmp/tmux-1/default" "$sel"
+check "longest cwd wins" "$SOCK_INNER	%2	/tmp/tmux-1/default	tmux" "$sel"
 
 sel2="$(cj_select /home/u/proj/lib/y.ts "$REG")"
-check "shallower file -> outer" "$SOCK_OUTER	%1	/tmp/tmux-1/default" "$sel2"
+check "shallower file -> outer" "$SOCK_OUTER	%1	/tmp/tmux-1/default	tmux" "$sel2"
 
 # A file under NO registered cwd: non-strict falls back to most-recent live...
 sel_fb="$(cj_select /elsewhere/z.ts "$REG")"
-check "non-match -> most-recent fallback" "$SOCK_INNER	%2	/tmp/tmux-1/default" "$sel_fb"
+check "non-match -> most-recent fallback" "$SOCK_INNER	%2	/tmp/tmux-1/default	tmux" "$sel_fb"
 # ...but strict mode (daemon security boundary) returns nothing.
 sel_strict="$(CJ_STRICT=1 cj_select /elsewhere/z.ts "$REG")"
 check "non-match + strict -> empty" "" "$sel_strict"
 # strict still opens a legitimately-matched file.
 sel_strict_ok="$(CJ_STRICT=1 cj_select /home/u/proj/packages/app/src/x.ts "$REG")"
-check "match + strict -> still selects" "$SOCK_INNER	%2	/tmp/tmux-1/default" "$sel_strict_ok"
+check "match + strict -> still selects" "$SOCK_INNER	%2	/tmp/tmux-1/default	tmux" "$sel_strict_ok"
+
+# A comux entry (5-field line) carries its token, server socket and mux kind.
+COMUX_PROJ="/home/u/comux-proj"
+SOCK_COMUX="$REG/nvim-comux-abc45.sock"; mksock "$SOCK_COMUX"
+printf '%s\t%s\t%s\t%s\t%s\n' "$SOCK_COMUX" "$COMUX_PROJ" "abc-45" "/tmp/copad-mux/sock" "comux" >"$REG/pane-comux-abc45.tsv"
+sel_comux="$(cj_select "$COMUX_PROJ/src/a.ts" "$REG")"
+check "comux entry selects with token + mux" "$SOCK_COMUX	abc-45	/tmp/copad-mux/sock	comux" "$sel_comux"
+# Without COPAD_MUX_SOCK the socket field is empty; the mux kind must not shift left.
+printf '%s\t%s\t%s\t%s\t%s\n' "$SOCK_COMUX" "$COMUX_PROJ" "abc-45" "" "comux" >"$REG/pane-comux-abc45.tsv"
+sel_comux_nosock="$(cj_select "$COMUX_PROJ/src/a.ts" "$REG")"
+check "comux entry with empty socket keeps mux" "$SOCK_COMUX	abc-45		comux" "$sel_comux_nosock"
+cj_read_tsv s_sock s_pane s_mux_sock s_mux <<<"$sel_comux_nosock"
+check "selection round-trips empty socket" "|comux" "$s_mux_sock|$s_mux"
+rm -f "$SOCK_COMUX" "$REG/pane-comux-abc45.tsv"
 
 # Dead socket (file present in tsv but socket removed) is skipped.
 rm -f "$SOCK_INNER"
 sel3="$(cj_select /home/u/proj/packages/app/src/x.ts "$REG")"
-check "dead inner socket falls back to outer" "$SOCK_OUTER	%1	/tmp/tmux-1/default" "$sel3"
+check "dead inner socket falls back to outer" "$SOCK_OUTER	%1	/tmp/tmux-1/default	tmux" "$sel3"
 
 # No live nvim at all -> empty.
 rm -f "$SOCK_OUTER"
 sel4="$(cj_select /home/u/proj/src/x.ts "$REG")"
 check "no live socket -> empty" "" "$sel4"
+
+# --- cj_focus: comux dispatch -------------------------------------------
+# A fake `comux` on PATH records its argv and the server socket it was pinned to.
+FAKEBIN="$TMPDIR_T/bin"; mkdir -p "$FAKEBIN"
+CALLS="$TMPDIR_T/comux-calls"
+cat >"$FAKEBIN/comux" <<EOF
+#!/usr/bin/env bash
+printf '%s|%s\n' "\${COPAD_MUX_SOCK:-}" "\$*" >>"$CALLS"
+EOF
+chmod +x "$FAKEBIN/comux"
+PATH="$FAKEBIN:$PATH" cj_focus "abc-45" "/tmp/copad-mux/sock" "comux"
+check "comux focus jumps by token on the registered server" "/tmp/copad-mux/sock|jump abc-45" "$(cat "$CALLS" 2>/dev/null)"
 
 # --- cj_registry_dir resolution order ------------------------------------
 RDT="$(mktemp -d)"
